@@ -2,6 +2,7 @@
 #include <linux/dcache.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
+#include <linux/hashtable.h>
 #include <linux/init.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
@@ -15,12 +16,11 @@
 #include <linux/semaphore.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-#include <linux/uaccess.h>
 
 MODULE_DESCRIPTION("UMS Scheduler module");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Giacomo Priamo <priamo.1701568@studenti.uniroma1.it>");
-MODULE_VERSION("1.6.0");
+MODULE_VERSION("3.6.0");
 
 #define MODULE_NAME_LOG "UMS: "   ///< The module's name (used for printk logging)
 #define SUCCESS 0                 ///< Success value
@@ -125,8 +125,9 @@ typedef struct UMSWorker_Thread {
     struct task_struct *ts;               ///< The worker's pthread task_struct
     struct proc_dir_entry *info;          ///< The info file under /proc/ums/<pid>/<sched_id>/workers
 
-    struct list_head list;  ///< List_head to keep it in @completion_list
-    struct list_head endl;  ///< List_head to keep it in @completion_list_backup
+    struct hlist_node hlist;              ///< hlist_node to keep it in @completion_list  
+    struct hlist_node hendl;              ///< hlist_node to keep it in @completion_list_backup    
+
 } UMSWorker_Thread;
 
 /**
@@ -142,13 +143,13 @@ typedef struct UMS_initial_info {
 
 UMSScheduler **schedulers_arr_p;  ///< Contains pointers to the UMS schedulers
 
-LIST_HEAD(completion_list);      ///< Cotains the completion list
-static int completion_list_cnt;  ///< Keeps track of the completion list's size
+DEFINE_HASHTABLE(completion_hlist, 3);              ///< Contains the completion list
+static int completion_list_cnt;                     ///< Keeps track of the completion list's size
 
-static int ready_workers_cnt;  ///< Keeps track of the available workers
+static int ready_workers_cnt;                       ///< Keeps track of the available workers
 
-LIST_HEAD(completion_list_backup);  ///< A never modified copy of @completion_list
-static int completion_backup_cnt;   ///< Keeps track of completion_list_backup's size
+DEFINE_HASHTABLE(completion_hlist_backup, 3);       ///< A never modified copy of @completion_list
+static int completion_backup_cnt;                   ///< Keeps track of @completion_hlist_backup's size
 
 static unsigned int cpus;  ///< The number of CPUS/cores in the system
 
@@ -181,6 +182,7 @@ static ssize_t myread(struct file *file, char __user *ubuf, size_t count, loff_t
     unsigned long long rt;
     UMSWorker_Thread *current_worker;
     UMSScheduler *sched;
+    unsigned bkt;
 
     printk(KERN_DEBUG MODULE_NAME_LOG "read: pid->%d, length=%ld, offset=%llu - Requesting info for %s/%s\n",
            current->pid, count, *ppos, file->f_path.dentry->d_parent->d_name.name, file->f_path.dentry->d_name.name);
@@ -189,15 +191,10 @@ static ssize_t myread(struct file *file, char __user *ubuf, size_t count, loff_t
         return 0;
 
     if (strcmp(file->f_path.dentry->d_name.name, "info") == 0) {
-        //printk(KERN_DEBUG MODULE_NAME_LOG "Want info!\n");
-        //printk(KERN_DEBUG MODULE_NAME_LOG "File: %s - Par = %s!\n", file->f_path.dentry->d_name.name,
-        //       file->f_path.dentry->d_parent->d_name.name);
 
         res = kstrtol(file->f_path.dentry->d_parent->d_name.name, 10, &tst);
         if (res != 0)
             pr_err("Conversion failed!\n");
-
-        //printk(KERN_DEBUG MODULE_NAME_LOG "ID is: %ld!\n", tst);
 
         id = (int)tst;
 
@@ -212,7 +209,7 @@ static ssize_t myread(struct file *file, char __user *ubuf, size_t count, loff_t
         else
             slen += sprintf(stat_buf, "Current State=SLEEPING");  //FUTURE: decide whether to  handle ending schedulers
 
-        list_for_each_entry(current_worker, &completion_list_backup, endl) {
+        hash_for_each(completion_hlist, bkt, current_worker, hlist) {
             pos += sprintf(pos, "%d ", current_worker->id);
         }
 
@@ -229,7 +226,7 @@ static ssize_t myread(struct file *file, char __user *ubuf, size_t count, loff_t
 
         printk(KERN_DEBUG MODULE_NAME_LOG "[UMS] Attempting to retrieve worker with id %d", id);
 
-        list_for_each_entry(current_worker, &completion_list_backup, endl) {
+        hash_for_each(completion_hlist_backup, bkt, current_worker, hendl) {
             if (current_worker->id == id)
                 goto leave_loop;
         }
@@ -299,6 +296,10 @@ static int ums_init_module(void) {
     }
     printk(KERN_DEBUG MODULE_NAME_LOG "Device registered successfully\n");
 
+    /* Initialize the hash tables */
+    hash_init(completion_hlist);
+    hash_init(completion_hlist_backup);
+
     /* Initialize counters */
     ready_workers_cnt = 0;
     completion_list_cnt = 0;
@@ -326,7 +327,9 @@ static int ums_init_module(void) {
 static void ums_cleanup_module(void) {
     UMSScheduler *sched;
     int i;
-    UMSWorker_Thread *cursor, *temp;
+    UMSWorker_Thread *cursor;
+    struct hlist_node *tmp;
+    unsigned bkt;
 
     /* Unregister the device */
     misc_deregister(&mdev);
@@ -335,7 +338,7 @@ static void ums_cleanup_module(void) {
     proc_remove(ent);
 
     /* Free kmalloc-allocated memory  */
-    list_for_each_entry_safe(cursor, temp, &completion_list_backup, endl) {
+    hash_for_each_safe(completion_hlist_backup, bkt, tmp, cursor, hendl) {
         if (down_interruptible(&proc_sem))
             pr_err("\nTask sleeping on proc_sem interrupted by a signal!\n");
 
@@ -343,8 +346,7 @@ static void ums_cleanup_module(void) {
 
         up(&proc_sem);
 
-        //list_del(&cursor->list);
-        list_del(&cursor->endl);
+        hash_del(&cursor->hendl);
 
         kfree(cursor);
     }
@@ -377,9 +379,9 @@ static void ums_cleanup_module(void) {
  * Returns the number of available worker threads
  */
 static inline int update_ready_workers(unsigned int cpu) {
-    struct list_head *current_item_list;
     UMSWorker_Thread *current_worker;
     int give;
+    unsigned bkt;
 
     if (down_interruptible(&compl_sem))
         pr_err("\nTask %d sleeping on compl_sem (upd) interrupted by a signal!\n", current->pid);
@@ -387,9 +389,7 @@ static inline int update_ready_workers(unsigned int cpu) {
     give = 0;
     ready_workers_cnt = 0;
 
-    list_for_each(current_item_list, &completion_list) {
-        current_worker = list_entry(current_item_list, UMSWorker_Thread, list);
-
+    hash_for_each(completion_hlist, bkt, current_worker, hlist) {
         if (current_worker->status == TASK_INTERRUPTIBLE && current_worker->tbound == UNBOUND && current_worker->bound == UNBOUND) {
             /* The task is sleeping & unused by any scheduler, thus it can be used */
 
@@ -471,8 +471,6 @@ static int create_ums_scheduler_thread(unsigned long data) {
         pr_err("\nData Write : Err!\n");
         return FAILURE;
     }
-
-    //printk(KERN_DEBUG MODULE_NAME_LOG "i: %ld tid: %d\n", sched_info.i, sched_info.tid);
 
     p = current;
 
@@ -603,7 +601,9 @@ static int create_worker_thread(unsigned long data) {
     if (down_interruptible(&compl_sem))
         pr_err("\nTask %d sleeping on compl_sem (cr_worker) interrupted by a signal!\n", current->pid);
 
-    list_add(&worker->list, &completion_list);
+    hash_add(completion_hlist, &worker->hlist, worker->tid);
+    printk(KERN_DEBUG MODULE_NAME_LOG "[Worker-%ld] Added to completion list: ...\n", winfo.i);
+
     completion_list_cnt += 1;
 
     up(&compl_sem);
@@ -611,7 +611,8 @@ static int create_worker_thread(unsigned long data) {
     if (down_interruptible(&bkp_sem))
         pr_err("\nTask %d sleeping on bkp_sem (cr_worker) interrupted by a signal!\n", current->pid);
 
-    list_add(&worker->endl, &completion_list_backup);
+    hash_add(completion_hlist_backup, &worker->hendl, worker->tid);
+
     completion_backup_cnt += 1;
 
     up(&bkp_sem);
@@ -644,7 +645,7 @@ static int compute_ready_workers(unsigned long data) {
     sched = schedulers_arr_p[(int)current->cpu];
     sched->switch_start = get_jiffies_64();
 
-    if (list_empty(&completion_list)) {
+    if (hash_empty(completion_hlist)) {
         printk(KERN_DEBUG MODULE_NAME_LOG "[UMS] There are no worker threads to be executed\n");
         ready_workers_cnt = -1;
 
@@ -661,7 +662,7 @@ static int compute_ready_workers(unsigned long data) {
     avail = update_ready_workers(current->cpu);
 
     while (avail == 0) {
-        if (list_empty(&completion_list)) {
+        if (hash_empty(completion_hlist)) {
             printk(KERN_DEBUG MODULE_NAME_LOG "[UMS] There are no worker threads to be executed\n");
             ready_workers_cnt = -1;
 
@@ -701,9 +702,9 @@ static int get_ready_worker(unsigned long data) {
     char buf[BUFSIZE];
     int ret, i, len;
     unsigned int c;
+    unsigned bkt;
 
     UMSWorker_Thread *current_worker;
-    struct list_head *current_item_list;
 
     pid_t ready_worker;
 
@@ -713,8 +714,7 @@ static int get_ready_worker(unsigned long data) {
     if (down_interruptible(&compl_sem))
         pr_err("\nTask %d sleeping on compl_sem (get_worker) interrupted by a signal!\n", current->pid);
 
-    list_for_each(current_item_list, &completion_list) {
-        current_worker = list_entry(current_item_list, UMSWorker_Thread, list);
+    hash_for_each(completion_hlist, bkt, current_worker, hlist) {
 
         if (current_worker->bound == UNBOUND) {
             ready_worker = current_worker->tid;
@@ -779,26 +779,22 @@ static int execute_worker(unsigned long data) {
     int i;
     struct task_struct *p;
     UMSScheduler *sched;
+    unsigned bkt;
 
+#if TEST2 == 1
     unsigned long long tst2;
+#endif
 
     UMSWorker_Thread *current_worker;
-    struct list_head *current_item_list;
 
     // 1) Free all tmpbound - [FUTURE] decide whether to make this execute only once
     if (down_interruptible(&compl_sem))
         pr_err("\nTask %d sleeping on compl_sem (exe) interrupted by a signal!\n", current->pid);
     i = 0;
 
-    list_for_each(current_item_list, &completion_list) {
-        current_worker = list_entry(current_item_list, UMSWorker_Thread, list);
-
-        //printk(KERN_DEBUG MODULE_NAME_LOG "[%i]\n",i);
-        //printk(KERN_DEBUG MODULE_NAME_LOG "worker: current_item->id=%d (%d) - status: %d\n",
-        //           current_worker->id, current_worker->tid, current_worker->status);
+    hash_for_each(completion_hlist, bkt, current_worker, hlist) {
 
         if (current_worker->bound == UNBOUND) {
-            //printk(KERN_DEBUG MODULE_NAME_LOG "RELEASING!\n");
             current_worker->tbound = UNBOUND;
         }
 
@@ -820,11 +816,11 @@ static int execute_worker(unsigned long data) {
     if (down_interruptible(&compl_sem))
         pr_err("\nTask %d sleeping on compl_sem (exe) interrupted by a signal!\n", current->pid);
 
+#if TEST2 == 1
     tst2 = get_jiffies_64();
+#endif
 
-    list_for_each(current_item_list, &completion_list) {
-        current_worker = list_entry(current_item_list, UMSWorker_Thread, list);
-
+    hash_for_each_possible(completion_hlist, current_worker, hlist, run_worker) { // This should be faster than linked lists
         if (current_worker->tid == run_worker) {
             printk(KERN_DEBUG MODULE_NAME_LOG "Worker found!");
             printk(KERN_DEBUG MODULE_NAME_LOG "current_item->id=%d (%d) - status: %d\n",
@@ -835,13 +831,12 @@ static int execute_worker(unsigned long data) {
     }
 
 found_worker:
-    //p = pid_task(find_vpid(current_worker->tid), PIDTYPE_PID);
-
 #if TEST2 == 1
     printk(KERN_DEBUG MODULE_NAME_LOG "[%d] JIFFIES for retrieve (exe) = Start: %llu End: %llu Diff: %llu Msecs: %llu \n", current->pid,
            tst2, get_jiffies_64(), get_jiffies_64() - tst2, jiffies64_to_msecs(get_jiffies_64() - tst2));
 #endif
 
+    //p = pid_task(find_vpid(current_worker->tid), PIDTYPE_PID);
     p = current_worker->ts;
     printk(KERN_DEBUG MODULE_NAME_LOG "Task struct for %d retrieved\n", p->pid);
 
@@ -892,26 +887,32 @@ static int handle_ending_worker(unsigned long data) {
     struct task_struct *p;
     unsigned int c;
 
+#if TEST2 == 1
     unsigned long long tst2;
+#endif
 
     UMSScheduler *sched;
     UMSWorker_Thread *current_worker;
-    struct list_head *current_item_list;
+    pid_t pid;
     p = current;
 
     if (copy_from_user(&status, (int *)data, sizeof(int))) {
         pr_err("Data Write : Err!\n");
         return FAILURE;
     }
+
+    pid = p->pid;
+
     printk(KERN_DEBUG MODULE_NAME_LOG "[Worker] Execution ended: %d (%d) (CPU: %u)\n", p->pid, status, p->cpu);
 
     if (down_interruptible(&compl_sem))
         pr_err("\nTask %d  sleeping on compl_sem (handle_ending) interrupted by a signal!\n", current->pid);
 
+#if TEST2 == 1
     tst2 = get_jiffies_64();
+#endif
 
-    list_for_each(current_item_list, &completion_list) {
-        current_worker = list_entry(current_item_list, UMSWorker_Thread, list);
+    hash_for_each_possible(completion_hlist, current_worker, hlist, pid) { // This should be faster than linked lists
 
         if (current_worker->tid == p->pid) {
             printk(KERN_DEBUG MODULE_NAME_LOG "Worker found!");
@@ -925,13 +926,13 @@ static int handle_ending_worker(unsigned long data) {
 
 found_ended_worker:
 #if TEST2 == 1
-    printk(KERN_DEBUG MODULE_NAME_LOG "[%d] JIFFIES for retrieve (exe) = Start: %llu End: %llu Diff: %llu Msecs: %llu \n", current->pid,
+    printk(KERN_DEBUG MODULE_NAME_LOG "[%d] JIFFIES for retrieve (end) = Start: %llu End: %llu Diff: %llu Msecs: %llu \n", current->pid,
            tst2, get_jiffies_64(), get_jiffies_64() - tst2, jiffies64_to_msecs(get_jiffies_64() - tst2));
 #endif
 
     printk(KERN_DEBUG MODULE_NAME_LOG "Removing worker from completion list!");
 
-    list_del(&current_worker->list);
+    hash_del(&current_worker->hlist);
 
     current_worker->status = 3;
     current_worker->switches_cnt += 1;
@@ -972,15 +973,17 @@ found_ended_worker:
  */
 static int yield_worker(unsigned long data) {
     int status, i;
+    pid_t pid;
     struct task_struct *p;
     unsigned int c;
 
-    unsigned long long tst2;
-
     UMSScheduler *sched;
 
+#if TEST2 == 1
+    unsigned long long tst2;
+#endif
+
     UMSWorker_Thread *current_worker;
-    struct list_head *current_item_list;
 
     p = current;
 
@@ -989,15 +992,19 @@ static int yield_worker(unsigned long data) {
         return FAILURE;
     }
 
+    pid = p->pid;
+
     printk(KERN_DEBUG MODULE_NAME_LOG "[Worker] Yielding: %d (%d) (CPU: %u)\n", p->pid, status, p->cpu);
 
     if (down_interruptible(&compl_sem))
         pr_err("\nTask %d sleeping on compl_sem (handle_yielding) interrupted by a signal!\n", current->pid);
 
+#if TEST2 == 1
     tst2 = get_jiffies_64();
+#endif
 
-    list_for_each(current_item_list, &completion_list) {
-        current_worker = list_entry(current_item_list, UMSWorker_Thread, list);
+
+    hash_for_each_possible(completion_hlist, current_worker, hlist, pid) { // This should be faster than linked lists
 
         if (current_worker->tid == p->pid) {
             printk(KERN_DEBUG MODULE_NAME_LOG "Worker found!");
@@ -1010,9 +1017,8 @@ static int yield_worker(unsigned long data) {
     }
 
 found_yielding_worker:
-
 #if TEST2 == 1
-    printk(KERN_DEBUG MODULE_NAME_LOG "[%d] JIFFIES for retrieve (exe) = Start: %llu End: %llu Diff: %llu Msecs: %llu \n", current->pid,
+    printk(KERN_DEBUG MODULE_NAME_LOG "[%d] JIFFIES for retrieve (yield) = Start: %llu End: %llu Diff: %llu Msecs: %llu \n", current->pid,
            tst2, get_jiffies_64(), get_jiffies_64() - tst2, jiffies64_to_msecs(get_jiffies_64() - tst2));
 #endif
 
@@ -1031,9 +1037,9 @@ found_yielding_worker:
     current_worker->switches_cnt += 1;
 
     /* Move the worker at the end of the completion list to ensure scheduling fairness */
-
-    list_del(&current_worker->list);
-    list_add(&current_worker->list, &completion_list);
+    hash_del(&current_worker->hlist);
+    hash_add(completion_hlist, &current_worker->hlist, current_worker->tid);
+    
     completion_list_cnt -= 1;
 
     up(&compl_sem);
